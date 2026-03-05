@@ -3,6 +3,7 @@ import FinanceDataReader as fdr
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from datetime import datetime
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
@@ -10,9 +11,7 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# 폰트 설정
-plt_params = {'font.family': 'DejaVu Sans', 'axes.unicode_minus': False}
-
+# --- 1. 예측 모델 클래스 (데이터 수집 안정화) ---
 class KODEX200AdvancedPredictor:
     def __init__(self, start_date='2020-01-01'):
         self.start_date = start_date
@@ -82,9 +81,11 @@ class KODEX200AdvancedPredictor:
         self.model.fit(self.scaler.fit_transform(X), y)
         self.feature_names = X.columns
 
-# --- UI 부분 ---
+# --- 2. UI 레이아웃 최적화 ---
 st.set_page_config(page_title="KODEX 200 리스크 진단", page_icon="📈", layout="wide")
-st.title("🚨 KODEX 200 통합 리스크 진단")
+
+st.title("🚨 KODEX 200 통합 리스크 진단 대시보드")
+st.markdown("매크로 경제, 삼성전자 모멘텀 및 지정학적 리스크를 통합 분석합니다.")
 
 @st.cache_resource
 def get_predictor():
@@ -92,9 +93,10 @@ def get_predictor():
     p.load_all_data(); p.calculate_indicators(); p.create_model()
     return p
 
-predictor = get_predictor()
+with st.spinner('실시간 시장 데이터를 분석 중입니다...'):
+    predictor = get_predictor()
 
-# 에러 수정: 데이터 추출 로직 보강
+# 리스크 데이터 추출
 last_features = []
 for feat in predictor.feature_names:
     if '_val' in feat:
@@ -108,15 +110,34 @@ for feat in predictor.feature_names:
 
 prediction = predictor.model.predict(predictor.scaler.transform([last_features]))[0]
 
-col1, col2 = st.columns(2)
-with col1:
-    level = "🔴 고위험" if prediction <= -8 else ("🟡 중위험" if prediction <= -4 else "🟢 저위험")
-    st.metric("예상 하락폭", f"{prediction:.2f}%")
-    st.subheader(f"위험 등급: {level}")
+# --- 상단 리포트 구역 ---
+st.divider()
+c1, c2 = st.columns([1, 2])
 
-with col2:
-    st.subheader("🔍 리스크 주도 요인")
-    term_map = {'SAM_Mom': '삼성전자 모멘텀', 'TNX_Mom': '금리 변화 속도', 'OIL_Mom': '유가 급등폭', 'GOLD_Mom': '금값 급등폭', 'USDKRW_val': '환율'}
-    importances = pd.Series(predictor.model.feature_importances_, index=predictor.feature_names).sort_values(ascending=False).head(5)
+with c1:
+    st.subheader("🚩 진단 결과")
+    level = "🔴 고위험 (HIGH)" if prediction <= -8 else ("🟡 중위험 (MEDIUM)" if prediction <= -4 else "🟢 저위험 (LOW)")
+    color = "red" if prediction <= -8 else ("orange" if prediction <= -4 else "green")
+    
+    st.markdown(f"<h1 style='color: {color}; font-size: 45px;'>{level}</h1>", unsafe_allow_html=True)
+    st.metric(label="12일 내 예상 최대 하락폭", value=f"{prediction:.2f}%")
+
+with c2:
+    st.subheader("🔍 리스크 주도 요인 분석")
+    term_map = {
+        'SAM_Mom': '삼성전자 모멘텀', 'SAM_val': '삼성전자 주가',
+        'TNX_Mom': '금리 변화 속도', 'TNX_val': '미 국채 금리',
+        'OIL_Mom': '유가 급등폭', 'WTI_OIL_val': '국제 유가',
+        'GOLD_Mom': '금값 급등폭', 'GOLD_val': '금 시세',
+        'USDKRW_val': '원/달러 환율', 'VIX_val': '시장 공포(VIX)',
+        'RSI': 'KODEX200 RSI', 'Volatility_20d': '지수 변동성', 'Returns_5d': '지수 단기수익률'
+    }
+    
+    importances = pd.Series(predictor.model.feature_importances_, index=predictor.feature_names).sort_values(ascending=False).head(6)
     importances.index = [term_map.get(x, x) for x in importances.index]
+    
+    # 가로형 바 차트로 변경하여 가독성 향상
     st.bar_chart(importances * 100)
+
+st.divider()
+st.info("💡 **알림:** 삼성전자 모멘텀은 지수 하락의 선행 지표 역할을 합니다. 금리 변화 속도가 높을 경우 기술주와 지수 전체에 강한 하방 압력이 작용합니다.")
