@@ -1,17 +1,93 @@
 import streamlit as st
+import FinanceDataReader as fdr
+import yfinance as yf
 import pandas as pd
-import matplotlib.pyplot as plt
-# 기존에 만드신 예측 클래스를 가져옵니다. 
-# (만약 한 파일에 합치려면 여기에 KODEX200AdvancedPredictor 클래스 코드를 전체 복사해 넣으세요)
-from predictor_model import KODEX200AdvancedPredictor 
+import numpy as np
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+import warnings
 
-# --- 페이지 기본 설정 ---
+warnings.filterwarnings('ignore')
+
+# --- 1. 예측 모델 클래스 (통합) ---
+class KODEX200AdvancedPredictor:
+    def __init__(self, start_date='2020-01-01'):
+        self.start_date = start_date
+        self.end_date = datetime.today().strftime('%Y-%m-%d')
+        self.data = {}
+        self.indicators = {}
+
+    def fetch_data(self, symbol, name, is_krx=False):
+        try:
+            df = fdr.DataReader(symbol, self.start_date, self.end_date)
+            if df is not None and not df.empty: return df
+        except: pass
+        try:
+            yf_sym = symbol if not is_krx else f"{symbol}.KS"
+            df = yf.download(yf_sym, start=self.start_date, end=self.end_date, progress=False)
+            if not df.empty: return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        except: pass
+        return None
+
+    def load_all_data(self):
+        asset_map = [
+            ('069500', 'KODEX200', True),
+            ('005930', 'SAMSUNG', True),    # 삼성전자 데이터 포함
+            ('^TNX', 'TNX', False),         
+            ('USDKRW=X', 'USDKRW', False),  
+            ('^VIX', 'VIX', False),         
+            ('CL=F', 'WTI_OIL', False),     
+            ('GC=F', 'GOLD', False)         
+        ]
+        for sym, name, is_kr in asset_map:
+            res = self.fetch_data(sym, name, is_kr)
+            if res is not None: self.data[name] = res
+
+    def calculate_indicators(self):
+        for name, df in self.data.items():
+            df = df.copy()
+            df['Returns_5d'] = df['Close'].pct_change(5)
+            df['Volatility_20d'] = df['Close'].pct_change().rolling(20).std() * np.sqrt(252)
+            delta = df['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            df['RSI'] = 100 - (100 / (1 + gain/(loss + 1e-10)))
+
+            if name == 'SAMSUNG': df['SAM_Momentum'] = df['Close'].pct_change(5)
+            elif name == 'TNX': df['TNX_Momentum'] = df['Close'].pct_change(10)
+            elif name == 'WTI_OIL': df['OIL_Momentum'] = df['Close'].pct_change(5)
+            elif name == 'GOLD': df['GOLD_Momentum'] = df['Close'].pct_change(5)
+            self.indicators[name] = df.fillna(method='bfill').fillna(method='ffill')
+
+    def create_model(self):
+        base = self.indicators['KODEX200'][['Close', 'RSI', 'Volatility_20d', 'Returns_5d']].copy()
+        for ext in ['TNX', 'VIX', 'USDKRW', 'WTI_OIL', 'GOLD', 'SAMSUNG']:
+            if ext in self.indicators:
+                ext_df = self.indicators[ext][['Close']].rename(columns={'Close': f'{ext}_val'})
+                if ext == 'SAMSUNG': ext_df['SAM_Mom'] = self.indicators['SAMSUNG']['SAM_Momentum']
+                elif ext == 'TNX': ext_df['TNX_Mom'] = self.indicators['TNX']['TNX_Momentum']
+                elif ext == 'WTI_OIL': ext_df['OIL_Mom'] = self.indicators['WTI_OIL']['OIL_Momentum']
+                elif ext == 'GOLD': ext_df['GOLD_Mom'] = self.indicators['GOLD']['GOLD_Momentum']
+                base = base.join(ext_df, how='left').ffill()
+
+        base['Target'] = (base['Close'].rolling(12).min().shift(-12) - base['Close']) / base['Close'] * 100
+        dataset = base.dropna()
+        X = dataset.drop(['Close', 'Target'], axis=1)
+        y = dataset['Target']
+        self.scaler = StandardScaler()
+        self.model = RandomForestRegressor(n_estimators=100, max_depth=7, random_state=42)
+        self.model.fit(self.scaler.fit_transform(X), y)
+        self.feature_names = X.columns
+
+
+# --- 2. 페이지 기본 설정 및 UI ---
 st.set_page_config(page_title="KODEX 200 리스크 진단 앱", page_icon="📈", layout="wide")
 
 st.title("🚨 KODEX 200 통합 리스크 진단 대시보드")
-st.markdown("매크로 경제 및 지정학적 리스크(유가, 금, 환율)를 통합 분석하여 하락 위험을 예측합니다.")
+st.markdown("매크로 경제(금리, 환율), 지정학적 리스크(유가, 금), 그리고 핵심 대장주(삼성전자)의 모멘텀을 통합 분석하여 하락 위험을 예측합니다.")
 
-# --- 데이터 로딩 및 분석 (캐싱을 통해 앱 속도 향상) ---
+# --- 데이터 로딩 및 분석 ---
 @st.cache_resource
 def get_predictor():
     p = KODEX200AdvancedPredictor()
@@ -24,15 +100,16 @@ with st.spinner('글로벌 금융 데이터 및 지정학적 리스크 지표를
     predictor = get_predictor()
 
 st.success('데이터 로딩 및 AI 모델 학습이 완료되었습니다!')
-
 st.divider()
 
-# --- 리스크 진단 결과 추출 로직 ---
+# --- 리스크 진단 데이터 추출 (삼성전자, 금 모멘텀 예외 처리 완비) ---
 last_features = []
 for feat in predictor.feature_names:
     if '_val' in feat:
         name = feat.replace('_val', '')
         last_features.append(predictor.indicators[name]['Close'].iloc[-1])
+    elif 'SAM_Mom' in feat:
+        last_features.append(predictor.indicators['SAMSUNG']['SAM_Momentum'].iloc[-1])
     elif 'TNX_Mom' in feat:
         last_features.append(predictor.indicators['TNX']['TNX_Momentum'].iloc[-1])
     elif 'OIL_Mom' in feat:
@@ -45,18 +122,18 @@ for feat in predictor.feature_names:
 scaled_feat = predictor.scaler.transform([last_features])
 prediction = predictor.model.predict(scaled_feat)[0]
 
-# 위험 등급 분류
+# --- 위험 등급 분류 ---
 if prediction <= -8:
-    level, color, icon = "🔴 고위험 (HIGH RISK)", "red", "🚨"
+    level, color, icon = "고위험 (HIGH RISK)", "red", "🔴"
     action_plan = "현재 시장은 금리 및 지정학적 리스크로 인해 매우 불안정한 상태입니다. 주식 비중을 즉시 축소하고 현금 및 안전자산(달러, 금) 비중 확대를 적극 권장합니다."
 elif prediction <= -4:
-    level, color, icon = "🟡 중위험 (MEDIUM RISK)", "orange", "⚠️"
+    level, color, icon = "중위험 (MEDIUM RISK)", "orange", "🟡"
     action_plan = "매크로 변동성이 커질 수 있는 경계 구간입니다. 유가와 환율 추이를 예의주시하며, 보유 종목의 손절가를 타이트하게 설정하십시오."
 else:
-    level, color, icon = "🟢 저위험 (LOW RISK)", "green", "✅"
+    level, color, icon = "저위험 (LOW RISK)", "green", "🟢"
     action_plan = "현재 지정학적 돌발 변수나 매크로 하락 위험은 통제 가능한 수준입니다. 기존의 투자 전략을 유지하며 우량주 중심의 투자가 유효합니다."
 
-# --- 화면 출력 (UI 구성) ---
+# --- 화면 출력 ---
 col1, col2 = st.columns(2)
 
 with col1:
@@ -72,15 +149,17 @@ with col2:
 
 st.divider()
 
-# --- 리스크 주도 요인 차트화 ---
-st.subheader("🔍 현재 하락 리스크를 주도하는 핵심 요인 Top 5")
+# --- 리스크 주도 요인 시각화 ---
+st.subheader("🔍 현재 하락 리스크를 주도하는 핵심 요인 Top 6")
 
 term_map = {
+    'SAM_Mom': '삼성전자 단기 모멘텀',
+    'SAM_val': '삼성전자 주가 수준',
     'RSI': 'KODEX200 RSI',
     'Volatility_20d': 'KODEX200 변동성',
     'Returns_5d': 'KODEX200 단기 수익률',
-    'TNX_val': '국채 10년물 금리',
-    'TNX_Mom': '금리 변화 속도',
+    'TNX_val': '미 국채 10년물 금리',
+    'TNX_Mom': '금리 변화 속도 (긴축 리스크)',
     'VIX_val': 'VIX (공포 지수)',
     'USDKRW_val': '원/달러 환율',
     'WTI_OIL_val': '국제 유가',
@@ -89,8 +168,7 @@ term_map = {
     'GOLD_Mom': '금값 급등폭 (안전자산 쏠림)'
 }
 
-importances = pd.Series(predictor.model.feature_importances_, index=predictor.feature_names).sort_values(ascending=False).head(5)
+importances = pd.Series(predictor.model.feature_importances_, index=predictor.feature_names).sort_values(ascending=False).head(6)
 importances.index = [term_map.get(x, x) for x in importances.index]
 
-# 스트림릿 내장 바 차트 활용
 st.bar_chart(importances * 100)
