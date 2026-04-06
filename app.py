@@ -58,8 +58,7 @@ class KODEX200AdvancedPredictor:
             elif name == 'TNX': df['TNX_Momentum'] = df['Close'].pct_change(10)
             elif name == 'WTI_OIL': df['OIL_Momentum'] = df['Close'].pct_change(5)
             elif name == 'GOLD': df['GOLD_Momentum'] = df['Close'].pct_change(5)
-            self.indicators[name] = df.fillna(method='bfill').fillna(method='ffill')
-
+            self.indicators[name] = df.bfill().ffill()
     def create_model(self):
         base = self.indicators['KODEX200'][['Close', 'RSI', 'Volatility_20d', 'Returns_5d']].copy()
         for ext in ['TNX', 'VIX', 'USDKRW', 'WTI_OIL', 'GOLD', 'SAMSUNG']:
